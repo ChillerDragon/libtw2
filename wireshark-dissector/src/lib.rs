@@ -24,7 +24,6 @@ use common::pretty;
 use format::Bitfield;
 use format::CommaSeparated;
 use format::NumBytes;
-use huffman::instances::TEEWORLDS as HUFFMAN;
 use intern::Interned;
 use intern::intern;
 use net::protocol;
@@ -44,16 +43,15 @@ use warn::Ignore;
 
 const SERIALIZED_SPEC: &'static str = include_str!("../../gamenet/generate/spec/ddnet-15.2.5.json");
 
-const TW_PORT: u32 = 8303;
 static mut PROTO_TW_PACKET: c_int = -1;
 static mut PROTO_TW_CHUNK: c_int = -1;
+static mut PROTO_TW_PACKET_HANDLE: sys::dissector_handle_t = 0 as _;
 
 static mut ETT_PACKET: c_int = -1;
 static mut ETT_PACKET_FLAGS: c_int = -1;
 static mut ETT_CHUNK: c_int = -1;
 static mut ETT_CHUNK_HEADER: c_int = -1;
 static mut ETT_CHUNK_HEADER_FLAGS: c_int = -1;
-static mut ETT_MSG_ID: c_int = -1;
 
 static mut HF_PACKET_FLAGS: c_int = -1;
 static mut HF_PACKET_CONTROL: c_int = -1;
@@ -91,11 +89,6 @@ fn c(s: &'static str) -> *const c_char {
     intern::intern_static_with_nul(s).c()
 }
 
-#[inline]
-const fn cc(s: &'static str) -> *const c_char {
-    s.as_bytes().as_ptr() as *const _
-}
-
 pub const HFRI_DEFAULT: sys::_header_field_info = sys::_header_field_info {
     name: 0 as _,
     abbrev: 0 as _,
@@ -111,10 +104,73 @@ pub const HFRI_DEFAULT: sys::_header_field_info = sys::_header_field_info {
     same_name_next: 0 as _,
 };
 
+#[derive(Default)]
+struct Counter(u64);
+
+impl Counter {
+    fn new() -> Counter {
+        Default::default()
+    }
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl<W> warn::Warn<W> for Counter {
+    fn warn(&mut self, _warning: W) {
+        self.0 += 1;
+    }
+}
+
 fn unpack_header(data: &[u8]) -> Option<protocol::PacketHeader> {
     let (raw_header, _) =
         protocol::PacketHeaderPacked::from_byte_slice(data)?;
     Some(raw_header.unpack_warn(&mut Ignore))
+}
+
+unsafe extern "C" fn dissect_tw_heur(
+    tvb: *mut sys::tvbuff_t,
+    pinfo: *mut sys::packet_info,
+    ttree: *mut sys::proto_tree,
+    _data: *mut c_void,
+) -> c_int {
+    if !dissect_tw_heur_impl(tvb).is_ok() {
+        return 0;
+    }
+    let conversation = sys::find_or_create_conversation(pinfo);
+    sys::conversation_set_dissector(conversation, PROTO_TW_PACKET_HANDLE);
+    dissect_tw_impl(tvb, pinfo, ttree).is_ok() as c_int
+}
+
+unsafe fn dissect_tw_heur_impl(
+    tvb: *mut sys::tvbuff_t,
+) -> Result<(), ()> {
+    let len = sys::tvb_reported_length(tvb).usize();
+    let mut original_buffer = Vec::with_capacity(len);
+    let mut decompress_buffer: ArrayVec<[u8; 2048]> = ArrayVec::new();
+    original_buffer.set_len(len);
+    sys::tvb_memcpy(tvb, original_buffer.as_mut_ptr() as *mut c_void, 0, len.u64());
+    let data: &[u8] = &original_buffer;
+
+    let mut warnings = Counter::new();
+    let packet = protocol::Packet::read(&mut warnings, data, &mut decompress_buffer).map_err(|_| ())?;
+    if !warnings.is_empty() {
+        return Err(());
+    }
+    match packet {
+        protocol::Packet::Connected(protocol::ConnectedPacket {
+            ack: _,
+            type_: protocol::ConnectedPacketType::Chunks(_, num_chunks, chunks_data),
+        }) => {
+            let mut iter = protocol::ChunksIter::new(chunks_data, num_chunks);
+            while let Some(_) = iter.next_warn(&mut warnings) { }
+        },
+        _ => {},
+    }
+    if !warnings.is_empty() {
+        return Err(());
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn dissect_tw(
@@ -123,12 +179,20 @@ unsafe extern "C" fn dissect_tw(
     ttree: *mut sys::proto_tree,
     _data: *mut c_void,
 ) -> c_int {
+    let _ = dissect_tw_impl(tvb, pinfo, ttree);
+    sys::tvb_reported_length(tvb) as c_int
+}
+
+unsafe fn dissect_tw_impl(
+    tvb: *mut sys::tvbuff_t,
+    pinfo: *mut sys::packet_info,
+    ttree: *mut sys::proto_tree,
+) -> Result<(), ()> {
     let spec = SPEC.as_ref().unwrap();
 
     sys::col_set_str((*pinfo).cinfo, sys::COL_PROTOCOL as c_int, c("TW\0"));
     sys::col_clear((*pinfo).cinfo, sys::COL_INFO as c_int);
 
-    let original_tvb = tvb;
     let mut tvb = tvb;
     let len = sys::tvb_reported_length(tvb).usize();
     let mut original_buffer = Vec::with_capacity(len);
@@ -143,7 +207,7 @@ unsafe extern "C" fn dissect_tw(
             let mut formatted: ArrayVec<[u8; 256]> = ArrayVec::new();
             write!(formatted, $fmt, $($args)*).unwrap();
             formatted.push(0);
-            $type($tree, $hf, tvb, $from, $to, $value, cc("%s\0"), CStr::from_bytes_with_nul(&formatted).unwrap().as_ptr())
+            $type($tree, $hf, tvb, $from, $to, $value, c("%s\0"), CStr::from_bytes_with_nul(&formatted).unwrap().as_ptr())
         }};
     }
     macro_rules! field_none {
@@ -151,7 +215,7 @@ unsafe extern "C" fn dissect_tw(
             let mut formatted: ArrayVec<[u8; 256]> = ArrayVec::new();
             write!(formatted, $fmt, $($args)*).unwrap();
             formatted.push(0);
-            sys::proto_tree_add_none_format($tree, $hf, tvb, $from, $to, cc("%s\0"), CStr::from_bytes_with_nul(&formatted).unwrap().as_ptr())
+            sys::proto_tree_add_none_format($tree, $hf, tvb, $from, $to, c("%s\0"), CStr::from_bytes_with_nul(&formatted).unwrap().as_ptr())
         }}
     }
     macro_rules! field_boolean {
@@ -176,12 +240,7 @@ unsafe extern "C" fn dissect_tw(
         };
     }
 
-    let header = if let Some(h) = unpack_header(data) {
-        h
-    } else {
-        return sys::tvb_reported_length(original_tvb) as c_int;
-    };
-
+    let header = unpack_header(data).ok_or(())?;
     let compression = header.flags & protocol::PACKETFLAG_COMPRESSION != 0;
     let request_resend = header.flags & protocol::PACKETFLAG_REQUEST_RESEND != 0;
     let connless = header.flags & protocol::PACKETFLAG_CONNLESS != 0;
@@ -269,47 +328,34 @@ unsafe extern "C" fn dissect_tw(
         NumBytes::new(len - header_size.assert_usize()),
     );
 
-    // Decompress the packet on our own, give a fake packet header so the
-    // packet decoding code doesn't get confused.
-    let fake_header = protocol::PacketHeader {
-        flags: header.flags & !protocol::PACKETFLAG_COMPRESSION,
-        ack: header.ack,
-        num_chunks: header.num_chunks,
-    };
-    decompress_buffer.extend(fake_header.pack().as_bytes().iter().cloned());
-    if compression {
-        if let Err(_) = HUFFMAN.decompress(&data[3..], &mut decompress_buffer) {
-            return sys::tvb_reported_length(original_tvb) as c_int;
-        }
+    let compression_protocol = protocol::Packet::decompress_if_needed(data, &mut decompress_buffer)
+        .map_err(|_| ())?;
+    if compression_protocol {
         let buffer = sys::wmem_alloc((*pinfo).pool, decompress_buffer.len().u64()) as *mut u8;
         sys::memcpy(buffer as *mut c_void, decompress_buffer.as_ptr() as *const c_void, decompress_buffer.len().u64());
         tvb = sys::tvb_new_child_real_data(tvb, buffer, decompress_buffer.len().assert_u32(), decompress_buffer.len().assert_i32());
-        sys::add_new_data_source(pinfo, tvb, cc("Decompressed Teeworlds packet\0"));
+        sys::add_new_data_source(pinfo, tvb, c("Decompressed Teeworlds packet\0"));
         data = &decompress_buffer;
     }
     tvb = sys::tvb_new_subset_remaining(tvb, header_size);
 
     let mut buffer: ArrayVec<[u8; 2048]> = ArrayVec::new();
-    let packet = if let Ok(p) = protocol::Packet::read(&mut Ignore, data, &mut buffer) {
-        p
-    } else {
-        return sys::tvb_reported_length(original_tvb) as c_int;
-    };
+    let packet = protocol::Packet::read(&mut Ignore, data, &mut buffer).map_err(|_| ())?;
 
     match packet {
         protocol::Packet::Connected(protocol::ConnectedPacket {
             ack: _,
-            type_: protocol::ConnectedPacketType::Control(ctrl)
+            type_: protocol::ConnectedPacketType::Control(ctrl),
         }) => {
             use protocol::ControlPacket::*;
 
             let ctrl_raw = data[3];
-            let ctrl_str = match ctrl {
-                KeepAlive => "Keep alive",
-                Connect => "Connect",
-                ConnectAccept => "Accept connection",
-                Accept => "Acknowledge connection acceptance",
-                Close(_) => "Disconnect",
+            let (ctrl_str, ctrl_id) = match ctrl {
+                KeepAlive => ("Keep alive", "ctrl.keep_alive\0"),
+                Connect => ("Connect", "ctrl.connect\0"),
+                ConnectAccept => ("Accept connection", "ctrl.accept_connection\0"),
+                Accept => ("Acknowledge connection acceptance", "ctrl.ack_accept_connection\0"),
+                Close(_) => ("Disconnect", "ctrl.disconnect\0"),
             };
             field_uint!(tree, HF_PACKET_CTRL, 3, 1, ctrl_raw,
                 "Control message: {} ({})",
@@ -324,6 +370,7 @@ unsafe extern "C" fn dissect_tw(
                     pretty::AlmostString::new(reason),
                 );
             }
+            sys::col_add_str((*pinfo).cinfo, sys::COL_INFO as c_int, c(ctrl_id));
         },
         protocol::Packet::Connected(protocol::ConnectedPacket {
             ack: _,
@@ -352,8 +399,16 @@ unsafe extern "C" fn dissect_tw(
                 let ti = sys::proto_tree_add_item(ttree, PROTO_TW_CHUNK, tvb, offset.assert_i32(), chunk_size.assert_i32(), sys::ENC_NA);
                 let tree = sys::proto_item_add_subtree(ti, ETT_CHUNK);
 
-                let th = field_none!(tree, HF_CHUNK_HEADER, offset.assert_i32(), if vital { 3 } else { 2 },
-                    "Header ({})", flags_description.or("none"));
+                let header_desc_add = if resend { ", re-sent" } else { "" };
+                let th = if let Some(seq) = sequence {
+                    field_none!(tree, HF_CHUNK_HEADER, offset.assert_i32(), if vital { 3 } else { 2 },
+                        "Header (vital: {}{})", seq, header_desc_add,
+                    )
+                } else {
+                    field_none!(tree, HF_CHUNK_HEADER, offset.assert_i32(), if vital { 3 } else { 2 },
+                        "Header (non-vital{})", header_desc_add,
+                    )
+                };
                 let header_tree = sys::proto_item_add_subtree(th, ETT_CHUNK_HEADER);
 
                 let flags_field = field_uint!(header_tree, HF_CHUNK_HEADER_FLAGS, offset.assert_i32(), 1, header.flags,
@@ -407,23 +462,45 @@ unsafe extern "C" fn dissect_tw(
             let info = CString::new(summaries).unwrap();
             sys::col_add_str((*pinfo).cinfo, sys::COL_INFO as c_int, info.as_ptr());
         }
-        protocol::Packet::Connless(_message) => {
-            sys::col_set_str((*pinfo).cinfo, sys::COL_INFO as c_int, c("connless\0"));
+        protocol::Packet::Connless(message) => {
+            let ti = sys::proto_tree_add_item(ttree, PROTO_TW_CHUNK, tvb, 0, -1, sys::ENC_NA);
+            let tree = sys::proto_item_add_subtree(ti, ETT_CHUNK);
+
+            let mut p = Unpacker::new(message);
+            let mut summaries = String::new();
+            let mut first_summary = true;
+            spec.dissect_connless(tree, tvb, &mut p,
+                &mut |summary| {
+                    if !summaries.is_empty() {
+                        summaries.push_str(", ");
+                    }
+                    let summary_c = CString::new(summary).unwrap();
+                    sys::proto_item_append_text(ti, c("%s%s\0"),
+                        if first_summary { c(": \0") } else { c(", \0") },
+                        summary_c.as_ptr(),
+                    );
+                    first_summary = false;
+                    summaries.push_str(summary);
+                }
+            );
+            let info = CString::new(summaries).unwrap();
+            sys::col_add_str((*pinfo).cinfo, sys::COL_INFO as c_int, info.as_ptr());
         },
     }
-
-    sys::tvb_reported_length(original_tvb) as c_int
+    Ok(())
 }
 
 unsafe extern "C" fn proto_register_teeworlds() {
     assert!(SPEC.replace(load_spec().unwrap()).is_none());
 
-    static mut PACKET_HF: [sys::hf_register_info; 10] = unsafe {[
+    let mut fields_info = Vec::new();
+    let mut etts = Vec::new();
+    fields_info.extend_from_slice(&[
         sys::hf_register_info {
             p_id: &HF_PACKET_FLAGS as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Flags\0"),
-                abbrev: cc("tw.packet.flags\0"),
+                name: c("Flags\0"),
+                abbrev: c("tw.packet.flags\0"),
                 type_: sys::FT_UINT16,
                 display: sys::BASE_HEX as c_int,
                 ..HFRI_DEFAULT
@@ -432,8 +509,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_COMPRESSION as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Compressed\0"),
-                abbrev: cc("tw.packet.flags.compression\0"),
+                name: c("Compressed\0"),
+                abbrev: c("tw.packet.flags.compression\0"),
                 type_: sys::FT_BOOLEAN,
                 ..HFRI_DEFAULT
             },
@@ -441,8 +518,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_REQUEST_RESEND as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Request resend\0"),
-                abbrev: cc("tw.packet.flags.request_resend\0"),
+                name: c("Request resend\0"),
+                abbrev: c("tw.packet.flags.request_resend\0"),
                 type_: sys::FT_BOOLEAN,
                 ..HFRI_DEFAULT
             },
@@ -450,8 +527,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_CONNLESS as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Connless\0"),
-                abbrev: cc("tw.packet.flags.connless\0"),
+                name: c("Connless\0"),
+                abbrev: c("tw.packet.flags.connless\0"),
                 type_: sys::FT_BOOLEAN,
                 ..HFRI_DEFAULT
             },
@@ -459,8 +536,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_CONTROL as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Control\0"),
-                abbrev: cc("tw.packet.flags.control\0"),
+                name: c("Control\0"),
+                abbrev: c("tw.packet.flags.control\0"),
                 type_: sys::FT_BOOLEAN,
                 ..HFRI_DEFAULT
             },
@@ -468,8 +545,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_ACK as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Acknowledged sequence number\0"),
-                abbrev: cc("tw.packet.ack\0"),
+                name: c("Acknowledged sequence number\0"),
+                abbrev: c("tw.packet.ack\0"),
                 type_: sys::FT_UINT16,
                 display: sys::BASE_DEC as c_int,
                 bitmask: 0,
@@ -479,8 +556,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_NUM_CHUNKS as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Number of chunks\0"),
-                abbrev: cc("tw.packet.num_chunks\0"),
+                name: c("Number of chunks\0"),
+                abbrev: c("tw.packet.num_chunks\0"),
                 type_: sys::FT_UINT8,
                 display: sys::BASE_DEC as c_int,
                 ..HFRI_DEFAULT
@@ -489,8 +566,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_CTRL as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Control message\0"),
-                abbrev: cc("tw.packet.ctrl\0"),
+                name: c("Control message\0"),
+                abbrev: c("tw.packet.ctrl\0"),
                 type_: sys::FT_UINT8,
                 display: sys::BASE_DEC as c_int,
                 ..HFRI_DEFAULT
@@ -499,8 +576,8 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_CTRL_CLOSE_REASON as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Close reason\0"),
-                abbrev: cc("tw.packet.ctrl.close_reason\0"),
+                name: c("Close reason\0"),
+                abbrev: c("tw.packet.ctrl.close_reason\0"),
                 type_: sys::FT_STRING,
                 display: sys::STR_ASCII as c_int,
                 ..HFRI_DEFAULT
@@ -509,36 +586,36 @@ unsafe extern "C" fn proto_register_teeworlds() {
         sys::hf_register_info {
             p_id: &HF_PACKET_PAYLOAD as *const _ as *mut _,
             hfinfo: sys::_header_field_info {
-                name: cc("Payload\0"),
-                abbrev: cc("tw.packet.payload\0"),
+                name: c("Payload\0"),
+                abbrev: c("tw.packet.payload\0"),
                 type_: sys::FT_BYTES,
                 ..HFRI_DEFAULT
             },
         },
-    ]};
-
-    static mut ETT: [*mut c_int; 6] = unsafe {[
+    ]);
+    etts.extend_from_slice(&[
         &ETT_PACKET as *const _ as *mut _,
         &ETT_PACKET_FLAGS as *const _ as *mut _,
-        &ETT_CHUNK as *const _ as *mut _,
-        &ETT_CHUNK_HEADER as *const _ as *mut _,
-        &ETT_CHUNK_HEADER_FLAGS as *const _ as *mut _,
-        &ETT_MSG_ID as *const _ as *mut _,
-    ]};
+    ]);
 
+    let fields_info = Box::leak(fields_info.into_boxed_slice());
+    let etts = Box::leak(etts.into_boxed_slice());
     PROTO_TW_PACKET = sys::proto_register_protocol(
-        cc("Teeworlds Protocol packet\0"),
-        cc("Teeworlds packet\0"),
-        cc("twp\0"),
+        c("Teeworlds Protocol packet\0"),
+        c("Teeworlds packet\0"),
+        c("twp\0"),
     );
-    sys::proto_register_field_array(PROTO_TW_PACKET, PACKET_HF.as_mut_ptr(), PACKET_HF.len().assert_i32());
+
+    sys::proto_register_field_array(PROTO_TW_PACKET, fields_info.as_mut_ptr(), fields_info.len().assert_i32());
+    sys::proto_register_subtree_array(etts.as_ptr(), etts.len().assert_i32());
+
     register_chunk_protocol(SPEC.as_ref().unwrap());
-    sys::proto_register_subtree_array(ETT.as_ptr(), ETT.len().assert_i32());
 }
 
 unsafe extern "C" fn proto_reg_handoff_teeworlds() {
-    let tw_packet = sys::create_dissector_handle(Some(dissect_tw), PROTO_TW_PACKET);
-    sys::dissector_add_uint(cc("udp.port\0"), TW_PORT, tw_packet);
+    PROTO_TW_PACKET_HANDLE = sys::create_dissector_handle(Some(dissect_tw), PROTO_TW_PACKET);
+    sys::heur_dissector_add(c("udp\0"), Some(dissect_tw_heur), c("TW over UDP\0"), c("tw_udp\0"), PROTO_TW_PACKET, sys::HEURISTIC_ENABLE);
+    sys::dissector_add_for_decode_as(c("udp.port\0"), PROTO_TW_PACKET_HANDLE);
 }
 
 trait IdentifierEx {
@@ -573,9 +650,9 @@ fn to_guid(uuid: Uuid) -> sys::e_guid_t {
 fn register_chunk_protocol(spec: &Spec) {
     unsafe {
         PROTO_TW_CHUNK = sys::proto_register_protocol(
-            cc("Teeworlds Protocol chunk\0"),
-            cc("Teeworlds chunk\0"),
-            cc("tw\0"),
+            c("Teeworlds Protocol chunk\0"),
+            c("Teeworlds chunk\0"),
+            c("tw\0"),
         );
     }
     let mut fields_info = Vec::new();
@@ -639,6 +716,11 @@ fn register_chunk_protocol(spec: &Spec) {
             },
         },
     ]});
+    etts.extend_from_slice(&unsafe {[
+        &ETT_CHUNK as *const _ as *mut _,
+        &ETT_CHUNK_HEADER as *const _ as *mut _,
+        &ETT_CHUNK_HEADER_FLAGS as *const _ as *mut _,
+    ]});
     spec.field_register_info(
         &mut |hfri| fields_info.push(hfri),
         &mut |ett| etts.push(ett),
@@ -663,6 +745,6 @@ pub unsafe extern "C" fn plugin_register() {
 mod test {
     #[test]
     fn spec_valid() {
-        super::load_spec();
+        super::load_spec().expect("invalid spec");
     }
 }

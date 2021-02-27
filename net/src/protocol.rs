@@ -174,6 +174,10 @@ impl<'a> ChunksIter<'a> {
             }
             return None;
         }
+        if self.data.len() == 4 && self.num_remaining_chunks == 0 {
+            // DDNet token.
+            return None;
+        }
         let (header, sequence, chunk_data_and_rest) = unwrap_or_return!(
             read_chunk_header(warn, self.data),
             self.excess_data(warn)
@@ -205,18 +209,6 @@ impl<'a> Iterator for ChunksIter<'a> {
 }
 
 impl<'a> ExactSizeIterator for ChunksIter<'a> { }
-
-pub fn compress<'a, B: Buffer<'a>>(bytes: &[u8], buffer: B)
-    -> Result<&'a [u8], buffer::CapacityError>
-{
-    HUFFMAN.compress(bytes, buffer)
-}
-
-pub fn decompress<'a, B: Buffer<'a>>(bytes: &[u8], buffer: B)
-    -> Result<&'a [u8], huffman::DecompressionError>
-{
-    HUFFMAN.decompress(bytes, buffer)
-}
 
 // TODO: Make this a member function of `Chunk`
 // vital: Some((sequence, resend))
@@ -279,6 +271,18 @@ fn write_connless_packet<'a, B: Buffer<'a>>(bytes: &[u8], buffer: B)
 }
 
 impl<'a> Packet<'a> {
+    fn needs_decompression(packet: &[u8]) -> bool {
+        if packet.len() > MAX_PACKETSIZE {
+            return false;
+        }
+        let (header, _) = unwrap_or_return!(
+            PacketHeaderPacked::from_byte_slice(packet),
+            false
+        );
+        let header = header.unpack_warn(&mut Ignore);
+        header.flags & PACKETFLAG_CONNLESS == 0 &&
+            header.flags & PACKETFLAG_COMPRESSION != 0
+    }
     /// Parse a packet.
     ///
     /// `buffer` needs to have at least size `MAX_PAYLOAD`.
@@ -287,15 +291,24 @@ impl<'a> Packet<'a> {
         where B: Buffer<'b>,
               W: Warn<Warning>,
     {
-        with_buffer(buffer, |b| Packet::read_impl(warn, bytes, b))
+        with_buffer(buffer, |b| Packet::read_impl(warn, bytes, Some(b)))
     }
-    fn read_impl<'d, 's, W>(warn: &mut W, bytes: &'d [u8], mut buffer: BufferRef<'d, 's>)
-        -> Result<Packet<'d>, PacketReadError>
+    pub fn read_panic_on_decompression<'b, W>(warn: &mut W, bytes: &'b [u8])
+        -> Result<Packet<'b>, PacketReadError>
+        where W: Warn<Warning>,
+    {
+        Packet::read_impl(warn, bytes, None)
+    }
+    fn read_impl<'d, 's, W>(
+        warn: &mut W,
+        bytes: &'d [u8],
+        buffer: Option<BufferRef<'d, 's>>,
+    ) -> Result<Packet<'d>, PacketReadError>
         where W: Warn<Warning>,
     {
         use self::PacketReadError::*;
 
-        assert!(buffer.remaining() >= MAX_PAYLOAD);
+        assert!(buffer.as_ref().map(|b| b.remaining() >= MAX_PACKETSIZE).unwrap_or(true));
         if bytes.len() > MAX_PACKETSIZE {
             return Err(TooLong);
         }
@@ -315,7 +328,12 @@ impl<'a> Packet<'a> {
         }
 
         let payload = if header.flags & PACKETFLAG_COMPRESSION != 0 {
-            unwrap_or_return!(decompress(payload, &mut buffer).ok(), Err(Compression))
+            let mut buffer = buffer.expect("read_panic_on_decompression called on compressed packet");
+            let decompressed = Packet::decompress(bytes, &mut buffer)
+                .map_err(|_| Compression)?;
+            let (_, payload) = PacketHeaderPacked::from_byte_slice(decompressed)
+                .unwrap();
+            payload
         } else {
             payload
         };
@@ -378,6 +396,51 @@ impl<'a> Packet<'a> {
             type_: type_,
         }))
     }
+    /// `buffer` needs to have at least size `MAX_PACKETSIZE`.
+    pub fn decompress_if_needed<B: Buffer<'a>>(packet: &[u8], buffer: B)
+        -> Result<bool, huffman::DecompressionError>
+    {
+        with_buffer(buffer, |b| Packet::decompress_if_needed_impl(packet, b))
+    }
+    fn decompress_if_needed_impl<'d, 's>(
+        packet: &[u8],
+        mut buffer: BufferRef<'d, 's>,
+    ) -> Result<bool, huffman::DecompressionError> {
+        assert!(buffer.remaining() >= MAX_PACKETSIZE);
+        if !Packet::needs_decompression(packet) {
+            return Ok(false);
+        }
+        Packet::decompress(packet, &mut buffer)?;
+        Ok(true)
+    }
+
+    fn decompress<B: Buffer<'a>>(packet: &[u8], buffer: B)
+        -> Result<&'a [u8], huffman::DecompressionError>
+    {
+        with_buffer(buffer, |b| Packet::decompress_impl(packet, b))
+    }
+    fn decompress_impl<'d, 's>(packet: &[u8], mut buffer: BufferRef<'d, 's>)
+        -> Result<&'d [u8], huffman::DecompressionError>
+    {
+        assert!(buffer.remaining() >= MAX_PACKETSIZE);
+        assert!(Packet::needs_decompression(packet));
+        let (header, payload) = PacketHeaderPacked::from_byte_slice(packet)
+            .expect("packet passed to decompress too short for header");
+        let header = header.unpack_warn(&mut Ignore);
+        assert!(header.flags & PACKETFLAG_CONNLESS == 0);
+        assert!(header.flags & PACKETFLAG_COMPRESSION != 0);
+
+        let fake_header = PacketHeader {
+            flags: header.flags & !PACKETFLAG_COMPRESSION,
+            ack: header.ack,
+            num_chunks: header.num_chunks,
+        };
+        buffer.write(fake_header.pack().as_bytes()).unwrap();
+        HUFFMAN.decompress(payload, &mut buffer)?;
+
+        Ok(buffer.initialized())
+    }
+
     pub fn write<'b, 'c, B1: Buffer<'b>, B2: Buffer<'c>>(&self,
                                                          compression_buffer: B1,
                                                          buffer: B2)
@@ -417,7 +480,7 @@ impl<'a> ConnectedPacket<'a> {
             ConnectedPacketType::Chunks(request_resend, num_chunks, payload) => {
                 assert!(compression_buffer.remaining() >= MAX_PAYLOAD);
                 let mut compression = 0;
-                let comp_result = compress(payload, &mut compression_buffer);
+                let comp_result = HUFFMAN.compress(payload, &mut compression_buffer);
                 if comp_result.map(|s| s.len() < payload.len()).unwrap_or(false) {
                     compression = PACKETFLAG_COMPRESSION;
                 }
@@ -707,6 +770,8 @@ mod test {
     #[test] fn w_chs3() { assert_no_warn(b"\x00\x00\x01\x40\x70\xcf") }
     #[test] fn w_cud1() { assert_warn(b"\x00\x00\x00\xff", ChunksUnknownData) }
     #[test] fn w_cud2() { assert_warn(b"\x00\x00\x01\x00\x00\x00", ChunksUnknownData) }
+    #[test] fn w_cud3() { assert_no_warn(b"\x00\x00\x01\x00\x00") }
+    #[test] fn w_cud4_ddnet() { assert_no_warn(b"\x00\x00\x01\x00\x00\x12\x34\x45\x67") }
     #[test] fn w_cnc1() { assert_warn(b"\x00\x00\x01", ChunksNumChunks) }
     #[test] fn w_cnc2() { assert_warn(b"\x00\x00\x00\x00\x00", ChunksNumChunks) }
     #[test] fn w_cnc_() { assert_warn(b"\x00\x00\x00", ChunksNoChunks) }

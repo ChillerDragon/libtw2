@@ -113,11 +113,14 @@ def fix_network(network, version):
 
     TUNE_PARAMS = ("sv", "tune", "params")
     EXTRA_PROJECTILE = ("sv", "extra", "projectile")
+    IS_DDNET = ("cl", "is", "ddnet")
     for i in range(len(network.Messages)):
         if network.Messages[i].name == TUNE_PARAMS:
             network.Messages[i] = NetMessage("SvTuneParams", [NetTuneParam(n) for n in TUNE_PARAM_NAMES[version]])
         elif network.Messages[i].name == EXTRA_PROJECTILE:
             network.Messages[i].values.append(NetObjectMember("projectile", ("projectile",)))
+        elif network.Messages[i].name == IS_DDNET:
+            network.Messages[i].values.append(NetIntAny("ddnet_version"))
     extra_msg_generation = set(v.type_name for m in network.Messages + network.System for v in m.values if isinstance(v, NetObjectMember))
     for i in range(len(network.Objects)):
         if network.Objects[i].name in extra_msg_generation:
@@ -142,15 +145,40 @@ def fix_network(network, version):
             network.Connless += [
                 NetConnless("Info", "inf3", [
                     NetIntString("token"),
-                    NetString("version"),
-                    NetString("name"),
-                    NetString("map"),
-                    NetString("game_type"),
+                    NetStringStrict("version"),
+                    NetStringStrict("name"),
+                    NetStringStrict("map"),
+                    NetStringStrict("game_type"),
                     NetIntString("flags"),
                     NetIntString("num_players"),
                     NetIntString("max_players"),
                     NetIntString("num_clients"),
                     NetIntString("max_clients"),
+                    NetClients("clients"),
+                ]),
+            ]
+        if version == VERSION_DDNET:
+            network.Connless += [
+                NetConnless("InfoExtended", "iext", [
+                    NetIntString("token"),
+                    NetStringStrict("version"),
+                    NetStringStrict("name"),
+                    NetStringStrict("map"),
+                    NetIntString("map_crc"),
+                    NetIntString("map_size"),
+                    NetStringStrict("game_type"),
+                    NetIntString("flags"),
+                    NetIntString("num_players"),
+                    NetIntString("max_players"),
+                    NetIntString("num_clients"),
+                    NetIntString("max_clients"),
+                    NetStringStrict("reserved"),
+                    NetClients("clients"),
+                ]),
+                NetConnless("InfoExtendedMore", "iex+", [
+                    NetIntString("token"),
+                    NetIntString("packet_no"),
+                    NetStringStrict("reserved"),
                     NetClients("clients"),
                 ]),
             ]
