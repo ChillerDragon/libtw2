@@ -13,7 +13,7 @@ pub use gamenet_common::snap_obj::TypeId;
 pub struct Spec {
     pub constants: Vec<Constant>,
     pub game_enumerations: Vec<Enumeration>,
-    pub game_flags: Vec<Flag>,
+    pub game_flags: Vec<Flags>,
     pub game_messages: Vec<Message>,
     pub snapshot_objects: Vec<Object>,
     pub system_messages: Vec<Message>,
@@ -34,7 +34,7 @@ pub struct Enumeration {
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Flag {
+pub struct Flags {
     pub name: Identifier,
     pub values: Vec<FlagValue>,
 }
@@ -95,10 +95,12 @@ pub enum Type {
     Boolean,
     Data,
     Enum(EnumType),
+    Flags(FlagsType),
     Int32(Int32Type),
     Int32String,
     Optional(OptionalType),
     PackedAddresses,
+    Rest,
     ServerinfoClient,
     Sha256,
     SnapshotObject(SnapshotObjectType),
@@ -119,6 +121,11 @@ pub struct ArrayType {
 pub struct EnumType {
     #[serde(rename = "enum")]
     pub enum_: Identifier,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FlagsType {
+    pub flags: Identifier,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]

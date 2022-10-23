@@ -1,4 +1,6 @@
-use anyhow::Context;
+use IdentifierEx;
+use anyhow::Context as _;
+use anyhow::anyhow;
 use anyhow::bail;
 use arrayvec::ArrayVec;
 use common::digest;
@@ -9,13 +11,16 @@ use crate::HFRI_DEFAULT;
 use crate::c;
 use crate::to_guid;
 use format::Bitfield;
+use format::CommaSeparated;
 use format::NumBytes;
 use gamenet_spec::MessageId;
 use intern::Interned;
 use intern::intern;
+use intern::intern_static_with_nul;
 use packer::Unpacker;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fmt;
@@ -24,11 +29,13 @@ use std::mem;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_uint;
+use std::rc::Rc;
 use std::str;
 use warn::Ignore;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Spec {
+    pub prefix: Interned,
     pub game_messages: HashMap<MessageId, Message>,
     pub system_messages: HashMap<MessageId, Message>,
     pub connless_messages: HashMap<[u8; 8], Message>,
@@ -38,6 +45,20 @@ pub struct Spec {
     pub id_msg_id_raw: FieldId,
     pub id_msg_id_ex: FieldId,
     pub id_connless_id_raw: FieldId,
+}
+#[derive(Debug)]
+pub struct Enumeration {
+    pub values: HashMap<i32, Interned>,
+}
+#[derive(Debug)]
+pub struct Flags {
+    pub values: Vec<Flag>,
+}
+#[derive(Debug)]
+pub struct Flag {
+    pub value: u32,
+    pub description: Interned,
+    pub identifier: Interned,
 }
 #[derive(Debug)]
 pub struct Message {
@@ -58,11 +79,13 @@ pub enum Type {
     BeUint16(SimpleType),
     Boolean(SimpleType),
     Data(SimpleType),
-    Enum,
+    Enum(EnumType),
+    Flags(FlagsType),
     Int32(Int32Type),
     Int32String(SimpleType),
     Optional(OptionalType),
     PackedAddresses,
+    Rest(SimpleType),
     ServerinfoClient,
     Sha256(SimpleType),
     SnapshotObject,
@@ -82,6 +105,20 @@ pub struct ArrayType {
     pub member_type: Box<Type>,
 }
 #[derive(Debug)]
+pub struct EnumType {
+    pub id: FieldId,
+    pub tree: FieldId,
+    pub id_raw: FieldId,
+    pub enum_: Rc<Enumeration>,
+}
+#[derive(Debug)]
+pub struct FlagsType {
+    pub id: FieldId,
+    pub tree: FieldId,
+    pub id_flags: Vec<FieldId>,
+    pub flags: Rc<Flags>,
+}
+#[derive(Debug)]
 pub struct Int32Type {
     pub id: FieldId,
     pub min: Option<i32>,
@@ -95,6 +132,12 @@ pub struct OptionalType {
 pub struct StringType {
     pub id: FieldId,
     pub disallow_cc: bool,
+}
+
+#[derive(Default)]
+struct Context {
+    game_enumerations: HashMap<Interned, Rc<Enumeration>>,
+    game_flags: HashMap<Interned, Rc<Flags>>,
 }
 
 impl Default for FieldId {
@@ -118,6 +161,23 @@ impl FieldId {
     }
 }
 
+impl Default for Spec {
+    fn default() -> Spec {
+        Spec {
+            prefix: intern_static_with_nul("\0"),
+            game_messages: Default::default(),
+            system_messages: Default::default(),
+            connless_messages: Default::default(),
+            tree_msg: Default::default(),
+            id_msg: Default::default(),
+            id_msg_system: Default::default(),
+            id_msg_id_raw: Default::default(),
+            id_msg_id_ex: Default::default(),
+            id_connless_id_raw: Default::default(),
+        }
+    }
+}
+
 const PERCENT_S: &'static [u8] = b"%s\0";
 const PS: *const c_char = PERCENT_S.as_ptr() as *const _;
 
@@ -126,12 +186,35 @@ fn load_gamenet_spec(s: &str) -> anyhow::Result<gamenet_spec::Spec> {
 }
 
 impl Spec {
-    pub fn load(s: &str) -> anyhow::Result<Spec> {
+    pub fn load(prefix: Interned, s: &str) -> anyhow::Result<Spec> {
         let spec = load_gamenet_spec(s)?;
+        let mut game_enumerations = HashMap::new();
+        for enum_ in spec.game_enumerations {
+            let enum_name = enum_.name.isnake();
+            let converted = Enumeration::from_gamenet(enum_)
+                .with_context(|| format!("failed to parse enumeration {}", enum_name))?;
+            if game_enumerations.insert(enum_name, Rc::new(converted)).is_some() {
+                bail!("duplicate game enumeration {}", enum_name);
+            }
+        }
+        let mut game_flags = HashMap::new();
+        for flags in spec.game_flags {
+            let flags_name = flags.name.isnake();
+            let converted = Flags::from_gamenet(flags)
+                .with_context(|| format!("failed to parse flags {}", flags_name))?;
+            if game_flags.insert(flags_name, Rc::new(converted)).is_some() {
+                bail!("duplicate game flags {}", flags_name);
+            }
+        }
+        let context = Context {
+            game_enumerations,
+            game_flags,
+        };
         let mut game_messages = HashMap::new();
         for msg in spec.game_messages {
             let msg_id = msg.id;
-            let converted = Message::from_gamenet(false, msg);
+            let converted = Message::from_gamenet(&context, prefix, false, msg)
+                .with_context(|| format!("failed to parse game message id {}", msg_id))?;
             if game_messages.insert(msg_id, converted).is_some() {
                 bail!("duplicate game message id {}", msg_id);
             }
@@ -139,7 +222,8 @@ impl Spec {
         let mut system_messages = HashMap::new();
         for msg in spec.system_messages {
             let msg_id = msg.id;
-            let converted = Message::from_gamenet(true, msg);
+            let converted = Message::from_gamenet(&context, prefix, true, msg)
+                .with_context(|| format!("failed to parse system message id {}", msg_id))?;
             if system_messages.insert(msg_id, converted).is_some() {
                 bail!("duplicate system message id {}", msg_id);
             }
@@ -147,12 +231,14 @@ impl Spec {
         let mut connless_messages = HashMap::new();
         for msg in spec.connless_messages {
             let msg_id = msg.id;
-            let converted = Message::from_gamenet_connless(msg);
+            let converted = Message::from_gamenet_connless(&context, prefix, msg)
+                .with_context(|| format!("failed to parse connless message id {}", AlmostString::new(&msg_id)))?;
             if connless_messages.insert(msg_id, converted).is_some() {
-                bail!("duplicate system message id {:?}", AlmostString::new(&msg_id));
+                bail!("duplicate connless message id {:?}", AlmostString::new(&msg_id));
             }
         }
         Ok(Spec {
+            prefix,
             game_messages,
             system_messages,
             connless_messages,
@@ -167,13 +253,13 @@ impl Spec {
             id: &FieldId,
             type_: sys::ftenum,
             description: &'static str,
-            name: &'static str,
+            name: Interned,
         ) -> sys::hf_register_info {
             sys::hf_register_info {
                 p_id: id.as_ptr(),
                 hfinfo: sys::_header_field_info {
                     name: c(description),
-                    abbrev: c(name),
+                    abbrev: name.c(),
                     type_: type_,
                     display: if type_ == sys::FT_INT32 {
                         sys::BASE_DEC as c_int
@@ -184,12 +270,13 @@ impl Spec {
                 },
             }
         }
-        h(field(&self.id_msg_system, sys::FT_BOOLEAN, "System\0", "tw.msg.system\0"));
+
+        h(field(&self.id_msg_system, sys::FT_BOOLEAN, "System\0", intern(&format!("{}.msg.system", self.prefix))));
         t(self.tree_msg.as_ptr());
-        h(field(&self.id_msg, sys::FT_STRING, "Message\0", "tw.msg\0"));
-        h(field(&self.id_msg_id_raw, sys::FT_INT32, "Raw message ID\0", "tw.msg.id_raw\0"));
-        h(field(&self.id_msg_id_ex, sys::FT_GUID, "Extended message ID\0", "tw.msg.id_ex\0"));
-        h(field(&self.id_connless_id_raw, sys::FT_STRING, "Raw connless message ID\0", "tw.msg.id_raw\0"));
+        h(field(&self.id_msg, sys::FT_STRING, "Message\0", intern(&format!("{}.msg", self.prefix))));
+        h(field(&self.id_msg_id_raw, sys::FT_INT32, "Raw message ID\0", intern(&format!("{}.msg.id_raw", self.prefix))));
+        h(field(&self.id_msg_id_ex, sys::FT_GUID, "Extended message ID\0", intern(&format!("{}.msg.id_ex", self.prefix))));
+        h(field(&self.id_connless_id_raw, sys::FT_STRING, "Raw connless message ID\0", intern(&format!("{}.msg.id_raw", self.prefix))));
         for msg in self.game_messages.values() {
             msg.field_register_info(h, t);
         }
@@ -380,27 +467,72 @@ impl Spec {
         }
     }
 }
+impl Enumeration {
+    fn from_gamenet(e: gamenet_spec::Enumeration) -> anyhow::Result<Enumeration> {
+        let mut values = HashMap::new();
+        let mut names = HashSet::new();
+        for pair in e.values {
+            let name = pair.name.isnake();
+            if values.insert(pair.value, name).is_some() {
+                bail!("duplicate game enumeration id {}", name);
+            }
+            if !names.insert(name) {
+                bail!("duplicate game enumeration name {}", name);
+            }
+        }
+        Ok(Enumeration {
+            values,
+        })
+    }
+}
+impl Flags {
+    fn from_gamenet(e: gamenet_spec::Flags) -> anyhow::Result<Flags> {
+        let mut seen_names = HashSet::new();
+        let mut seen_values = HashSet::new();
+        let mut values = Vec::new();
+        for pair in e.values {
+            let name = pair.name.isnake();
+            if !seen_names.insert(name) {
+                bail!("duplicate game flag name {}", name);
+            }
+            if !seen_values.insert(pair.value) {
+                bail!("duplicate game flag value {}", pair.value);
+            }
+            if pair.value.count_ones() != 1 {
+                bail!("game flag value has more than one bit set to 1: {}", pair.value);
+            }
+            values.push(Flag {
+                value: pair.value,
+                description: pair.name.idesc(),
+                identifier: name,
+            });
+        }
+        Ok(Flags {
+            values,
+        })
+    }
+}
 impl Message {
-    fn from_gamenet(system: bool, m: gamenet_spec::Message) -> Message {
+    fn from_gamenet(context: &Context, prefix: Interned, system: bool, m: gamenet_spec::Message) -> anyhow::Result<Message> {
         let sys_prefix = if system { "sys" } else { "game" };
         let name = intern(&format!("{}.{}", sys_prefix, m.name.snake()));
-        let prefix = intern(&format!("tw.{}", name));
-        Message {
+        let prefix = intern(&format!("{}.{}", prefix, name));
+        Ok(Message {
             name,
             members: m.members.into_iter().map(
-                |member| Member::from_gamenet(prefix, member)
-            ).collect(),
-        }
+                |member| Member::from_gamenet(context, prefix, member)
+            ).collect::<Result<_, _>>()?,
+        })
     }
-    fn from_gamenet_connless(m: gamenet_spec::ConnlessMessage) -> Message {
+    fn from_gamenet_connless(context: &Context, prefix: Interned, m: gamenet_spec::ConnlessMessage) -> anyhow::Result<Message> {
         let name = intern(&format!("connless.{}", m.name.snake()));
-        let prefix = intern(&format!("tw.{}", name));
-        Message {
+        let prefix = intern(&format!("{}.{}", prefix, name));
+        Ok(Message {
             name,
             members: m.members.into_iter().map(
-                |member| Member::from_gamenet(prefix, member)
-            ).collect(),
-        }
+                |member| Member::from_gamenet(context, prefix, member)
+            ).collect::<Result<_, _>>()?,
+        })
     }
     pub fn field_register_info<FH, FT>(&self, h: &mut FH, t: &mut FT) where
         FH: FnMut(sys::hf_register_info),
@@ -423,12 +555,12 @@ impl Message {
     }
 }
 impl Member {
-    fn from_gamenet(prefix: Interned, m: gamenet_spec::Member) -> Member {
-        Member {
+    fn from_gamenet(context: &Context, prefix: Interned, m: gamenet_spec::Member) -> anyhow::Result<Member> {
+        Ok(Member {
             description: intern(&m.name.desc()),
             identifier: intern(&format!("{}.{}", prefix, m.name.snake())),
-            type_: m.type_.into(),
-        }
+            type_: Type::from_gamenet(context, m.type_)?,
+        })
     }
     pub fn field_register_info<FH, FT>(&self, h: &mut FH, t: &mut FT) where
         FH: FnMut(sys::hf_register_info),
@@ -437,18 +569,36 @@ impl Member {
         self.type_.field_register_info(h, t, self.description, self.identifier);
     }
 }
-impl From<gamenet_spec::Type> for Type {
-    fn from(t: gamenet_spec::Type) -> Type {
+impl Type {
+    fn from_gamenet(context: &Context, t: gamenet_spec::Type) -> anyhow::Result<Type> {
         use gamenet_spec::Type::*;
-        match t {
+        Ok(match t {
             Array(i) => Type::Array(ArrayType {
                 count: i.count,
-                member_type: Box::new((*i.member_type).into()),
+                member_type: Box::new(Type::from_gamenet(context, *i.member_type)?),
             }),
             BeUint16 => Type::BeUint16(Default::default()),
             Boolean => Type::Boolean(Default::default()),
             Data => Type::Data(Default::default()),
-            Enum(..) => Type::Enum,
+            Enum(i) => Type::Enum(EnumType {
+                id: Default::default(),
+                tree: Default::default(),
+                id_raw: Default::default(),
+                enum_: context.game_enumerations.get(&i.enum_.isnake())
+                    .ok_or_else(|| anyhow!("unknown enumeration {}", i.enum_.snake()))?
+                    .clone(),
+            }),
+            Flags(i) => {
+                let flags = context.game_flags.get(&i.flags.isnake())
+                    .ok_or_else(|| anyhow!("unknown flags {}", i.flags.snake()))?
+                    .clone();
+                Type::Flags(FlagsType {
+                    id: Default::default(),
+                    tree: Default::default(),
+                    id_flags: (0..flags.values.len()).map(|_| Default::default()).collect(),
+                    flags,
+                })
+            },
             Int32(i) => Type::Int32(Int32Type {
                 id: Default::default(),
                 min: i.min,
@@ -456,9 +606,10 @@ impl From<gamenet_spec::Type> for Type {
             }),
             Int32String => Type::Int32String(Default::default()),
             Optional(i) => Type::Optional(OptionalType {
-                inner: Box::new((*i.inner).into()),
+                inner: Box::new(Type::from_gamenet(context, *i.inner)?),
             }),
             PackedAddresses => Type::PackedAddresses,
+            Rest => Type::Rest(Default::default()),
             ServerinfoClient => Type::ServerinfoClient,
             Sha256 => Type::Sha256(Default::default()),
             SnapshotObject(..) => Type::SnapshotObject,
@@ -470,7 +621,7 @@ impl From<gamenet_spec::Type> for Type {
             TuneParam => Type::TuneParam(Default::default()),
             Uint8 => Type::Uint8(Default::default()),
             Uuid => Type::Uuid(Default::default()),
-        }
+        })
     }
 }
 impl Type {
@@ -487,14 +638,60 @@ impl Type {
             BeUint16(i) => (sys::FT_UINT16, i.id.as_ptr()),
             Boolean(i) => (sys::FT_BOOLEAN, i.id.as_ptr()),
             Data(i) => (sys::FT_BYTES, i.id.as_ptr()),
-            Enum => return,
-            // TODO: Does that work with enum reprs? (FIELDCONVERT)
-            //Enum => sys::FT_INT32,
+            Enum(i) => {
+                t(i.tree.as_ptr());
+                h(sys::hf_register_info {
+                    p_id: i.id.as_ptr(),
+                    hfinfo: sys::_header_field_info {
+                        name: desc.c(),
+                        abbrev: identifier.c(),
+                        type_: sys::FT_STRING,
+                        ..HFRI_DEFAULT
+                    },
+                });
+                h(sys::hf_register_info {
+                    p_id: i.id_raw.as_ptr(),
+                    hfinfo: sys::_header_field_info {
+                        name: intern(&format!("{} (raw)", desc)).c(),
+                        abbrev: intern(&format!("{}.raw", identifier)).c(),
+                        type_: sys::FT_INT32,
+                        display: sys::BASE_DEC as c_int,
+                        ..HFRI_DEFAULT
+                    },
+                });
+                return;
+            },
+            Flags(i) => {
+                t(i.tree.as_ptr());
+                h(sys::hf_register_info {
+                    p_id: i.id.as_ptr(),
+                    hfinfo: sys::_header_field_info {
+                        name: desc.c(),
+                        abbrev: identifier.c(),
+                        type_: sys::FT_UINT32,
+                        display: sys::BASE_HEX as c_int,
+                        ..HFRI_DEFAULT
+                    },
+                });
+                for (idx, id) in i.id_flags.iter().enumerate() {
+                    h(sys::hf_register_info {
+                        p_id: id.as_ptr(),
+                        hfinfo: sys::_header_field_info {
+                            name: i.flags.values[idx].description.c(),
+                            abbrev: intern(&format!("{}.{}", identifier, i.flags.values[idx].identifier)).c(),
+                            type_: sys::FT_BOOLEAN,
+                            ..HFRI_DEFAULT
+                        },
+                    });
+                }
+                return;
+            },
             Int32(i) => (sys::FT_INT32, i.id.as_ptr()),
             Int32String(i) => (sys::FT_INT32, i.id.as_ptr()),
             Optional(i) =>
                 return i.inner.field_register_info(h, t, desc, identifier),
             PackedAddresses => return,
+            Rest(i) => (sys::FT_BYTES, i.id.as_ptr()),
             ServerinfoClient => return,
             Sha256(i) => (sys::FT_STRING, i.id.as_ptr()),
             SnapshotObject => return,
@@ -504,14 +701,9 @@ impl Type {
             Uint8(i) => (sys::FT_UINT8, i.id.as_ptr()),
             Uuid(i) => (sys::FT_GUID, i.id.as_ptr()),
         };
-        let display = if matches!(type_,
-            sys::FT_INT32
-            | sys::FT_UINT8
-            | sys::FT_UINT16
-        ) {
-            sys::BASE_DEC as c_int
-        } else {
-            HFRI_DEFAULT.display
+        let display = match type_ {
+            sys::FT_INT32 | sys::FT_UINT8 | sys::FT_UINT16 => sys::BASE_DEC as c_int,
+            _ => HFRI_DEFAULT.display,
         };
         h(sys::hf_register_info {
             p_id: hf_id,
@@ -592,7 +784,86 @@ impl Type {
                     NumBytes::new(v.len()),
                 ));
             },
-            //Enum => return,
+            Enum(i) => {
+                let v = p.read_int(&mut Ignore).map_err(|_| ())?;
+                let name = i.enum_.values.get(&v);
+                let buffer;
+                let name_c = if let Some(name) = name {
+                    name.c()
+                } else {
+                    buffer = CString::new(format!("{}", v)).unwrap();
+                    buffer.as_ptr()
+                };
+                let id_field = sys::proto_tree_add_string_format(
+                    tree,
+                    i.id.get(),
+                    tvb,
+                    pos.assert_i32(),
+                    (p.num_bytes_read() - pos).assert_i32(),
+                    name_c,
+                    PS,
+                    if let Some(name) = name {
+                        bformat!("{}: {}", desc, name)
+                    } else {
+                        bformat!("{}: [unknown] ({})", desc, v)
+                    },
+                );
+                let id_subtree = sys::proto_item_add_subtree(id_field, i.tree.get());
+                sys::proto_tree_add_int_format(
+                    id_subtree,
+                    i.id_raw.get(),
+                    tvb,
+                    pos.assert_i32(),
+                    (p.num_bytes_read() - pos).assert_i32(),
+                    v as c_int,
+                    PS,
+                    bformat!("Raw: {}", v),
+                );
+            },
+            Flags(i) => {
+                let v = p.read_int(&mut Ignore).map_err(|_| ())? as u32;
+                let mut flag_names: CommaSeparated<[u8; 256]> = CommaSeparated::new();
+                for flag in &i.flags.values {
+                    if v & flag.value != 0 {
+                        flag_names.add(flag.identifier.as_str());
+                    }
+                }
+                let id_field = sys::proto_tree_add_uint_format(
+                    tree,
+                    i.id.get(),
+                    tvb,
+                    pos.assert_i32(),
+                    (p.num_bytes_read() - pos).assert_i32(),
+                    v as c_uint,
+                    PS,
+                    bformat!("{}: {} (0x{:x})", desc, flag_names.or("none"), v),
+                );
+                let id_subtree = sys::proto_item_add_subtree(id_field, i.tree.get());
+                let num_unused_bytes = i.flags.values.iter()
+                    .map(|v| v.value.leading_zeros())
+                    .min()
+                    .unwrap_or(0)
+                    .usize()
+                    / 8;
+                let v_bytes = &v.to_be_bytes()[num_unused_bytes..];
+                for (idx, id) in i.id_flags.iter().enumerate() {
+                    let flag = i.flags.values[idx].value;
+                    sys::proto_tree_add_boolean_format(
+                        id_subtree,
+                        id.get(),
+                        tvb,
+                        pos.assert_i32(),
+                        (p.num_bytes_read() - pos).assert_i32(),
+                        (v & flag != 0) as c_uint,
+                        PS,
+                        bformat!("{} = {} {}",
+                            Bitfield::new(v_bytes, flag.u64()),
+                            if v & flag != 0 { "   " } else { "NOT" },
+                            i.flags.values[idx].identifier,
+                        ),
+                    );
+                }
+            },
             Int32(i) => {
                 let v = p.read_int(&mut Ignore).map_err(|_| ())?;
                 sys::proto_tree_add_int_format(
@@ -625,8 +896,24 @@ impl Type {
                 let _ = i.inner.dissect(desc, tree, tvb, p);
                 return Ok(());
             },
-            //PackedAddresses => return,
-            //ServerinfoClient => return,
+            PackedAddresses => return Err(()),
+            Rest(i) => {
+                let v = p.read_rest().map_err(|_| ())?;
+                let ti = sys::proto_tree_add_bytes_with_length(
+                    tree,
+                    i.id.get(),
+                    tvb,
+                    pos.assert_i32(),
+                    (p.num_bytes_read() - pos).assert_i32(),
+                    v.as_ptr(),
+                    v.len().assert_i32(),
+                );
+                sys::proto_item_set_text(ti, PS, bformat!("{} ({})",
+                    desc,
+                    NumBytes::new(v.len()),
+                ));
+            },
+            ServerinfoClient => return Err(()),
             Sha256(i) => {
                 let size = mem::size_of::<digest::Sha256>();
                 let v = p.read_raw(size).map_err(|_| ())?;
@@ -643,7 +930,7 @@ impl Type {
                     bformat!("{}: {}", desc, v),
                 );
             }
-            //SnapshotObject => return,
+            SnapshotObject => return Err(()),
             String(i) => {
                 let v = p.read_string().map_err(|_| ())?;
                 let cstring_v = CString::new(v).unwrap();
@@ -711,7 +998,6 @@ impl Type {
                     bformat!("{}: {}", desc, v),
                 );
             },
-            _ => return Err(()),
         };
         Ok(())
     }

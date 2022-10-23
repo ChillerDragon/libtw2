@@ -1,4 +1,3 @@
-use rustc_serialize;
 use serverbrowse::protocol;
 use serverbrowse::protocol::IpAddr;
 
@@ -6,7 +5,7 @@ use std::fmt;
 use std::net;
 
 /// Protocol version of the `SERVERBROWSE_GETINFO` packet.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, RustcEncodable)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProtocolVersion {
     /// `SERVERBROWSE_GETINFO_5`.
     V5,
@@ -51,7 +50,16 @@ impl Addr {
     pub fn from_socket_addr(addr: net::SocketAddr) -> Addr {
         let (ip_addr, port) = match addr {
             net::SocketAddr::V4(a) => (IpAddr::V4(*a.ip()), a.port()),
-            net::SocketAddr::V6(a) => (IpAddr::V6(*a.ip()), a.port()),
+            net::SocketAddr::V6(a) => {
+                let mut ip = IpAddr::V6(*a.ip());
+                // TODO: switch to `to_ipv4_mapped` in the future.
+                if let Some(v4) = a.ip().to_ipv4() {
+                    if !a.ip().is_loopback() {
+                        ip = IpAddr::V4(v4);
+                    }
+                }
+                (ip, a.port())
+            }
         };
         Addr(protocol::Addr { ip_address: ip_addr, port: port })
     }
@@ -101,12 +109,6 @@ impl fmt::Display for Addr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let &Addr(ref inner) = self;
         fmt::Display::fmt(inner, f)
-    }
-}
-
-impl rustc_serialize::Encodable for Addr {
-    fn encode<S:rustc_serialize::Encoder>(&self, s: &mut S) -> Result<(),S::Error> {
-        s.emit_str(&self.to_string())
     }
 }
 
