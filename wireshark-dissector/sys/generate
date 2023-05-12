@@ -46,6 +46,7 @@ bindgen \
 	--whitelist-function '^proto_tree_add_uint(_format)?$' \
 	--whitelist-function '^tvb_memcpy$' \
 	--whitelist-function '^tvb_new_child_real_data$' \
+	--whitelist-function '^ws_log$' \
 	--whitelist-function '^tvb_new_subset_remaining$' \
 	--whitelist-function '^tvb_reported_length$' \
 	--whitelist-function '^wmem_alloc$' \
